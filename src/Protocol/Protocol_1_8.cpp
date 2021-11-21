@@ -123,20 +123,18 @@ cProtocol_1_8_0::cProtocol_1_8_0(cClientHandle * a_Client, const AString & a_Ser
 
 				LOGD("Player at %s connected via BungeeCord", Params[1].c_str());
 
-				m_Client->SetIPString(Params[1]);
-
 				cUUID UUID;
 				UUID.FromString(Params[2]);
-				m_Client->SetUUID(UUID);
 
 				Json::Value root;
 				if (!JsonUtils::ParseString(Params[3], root))
 				{
 					LOGERROR("Unable to parse player properties: '%s'", Params[3]);
+					m_Client->ProxyInit(Params[1], UUID);
 				}
 				else
 				{
-					m_Client->SetProperties(root);
+					m_Client->ProxyInit(Params[1], UUID, root);
 				}
 			}
 			else
@@ -174,7 +172,7 @@ cProtocol_1_8_0::cProtocol_1_8_0(cClientHandle * a_Client, const AString & a_Ser
 
 
 
-void cProtocol_1_8_0::DataReceived(cByteBuffer & a_Buffer, ContiguousByteBuffer && a_Data)
+void cProtocol_1_8_0::DataReceived(cByteBuffer & a_Buffer, ContiguousByteBuffer & a_Data)
 {
 	if (m_IsEncrypted)
 	{
@@ -182,6 +180,18 @@ void cProtocol_1_8_0::DataReceived(cByteBuffer & a_Buffer, ContiguousByteBuffer 
 	}
 
 	AddReceivedData(a_Buffer, a_Data);
+}
+
+
+
+
+
+void cProtocol_1_8_0::DataPrepared(ContiguousByteBuffer & a_Data)
+{
+	if (m_IsEncrypted)
+	{
+		m_Encryptor.ProcessData(a_Data.data(), a_Data.size());
+	}
 }
 
 
@@ -252,12 +262,13 @@ void cProtocol_1_8_0::SendBlockChanges(int a_ChunkX, int a_ChunkZ, const sSetBlo
 	Pkt.WriteBEInt32(a_ChunkX);
 	Pkt.WriteBEInt32(a_ChunkZ);
 	Pkt.WriteVarInt32(static_cast<UInt32>(a_Changes.size()));
-	for (sSetBlockVector::const_iterator itr = a_Changes.begin(), end = a_Changes.end(); itr != end; ++itr)
+
+	for (const auto & Change : a_Changes)
 	{
-		Int16 Coords = static_cast<Int16>(itr->m_RelY | (itr->m_RelZ << 8) | (itr->m_RelX << 12));
+		Int16 Coords = static_cast<Int16>(Change.m_RelY | (Change.m_RelZ << 8) | (Change.m_RelX << 12));
 		Pkt.WriteBEInt16(Coords);
-		Pkt.WriteVarInt32(static_cast<UInt32>(itr->m_BlockType & 0xFFF) << 4 | (itr->m_BlockMeta & 0xF));
-	}  // for itr - a_Changes[]
+		Pkt.WriteVarInt32(static_cast<UInt32>(Change.m_BlockType & 0xFFF) << 4 | (Change.m_BlockMeta & 0xF));
+	}
 }
 
 
@@ -369,7 +380,7 @@ void cProtocol_1_8_0::SendChunkData(const ContiguousByteBufferView a_ChunkData)
 	ASSERT(m_State == 3);  // In game mode?
 
 	cCSLock Lock(m_CSPacket);
-	SendData(a_ChunkData);
+	m_Client->SendData(a_ChunkData);
 }
 
 
@@ -833,7 +844,7 @@ void cProtocol_1_8_0::SendLogin(const cPlayer & a_Player, const cWorld & a_World
 	// Send the spawn position:
 	{
 		cPacketizer Pkt(*this, pktSpawnPosition);
-		Pkt.WriteXYZPosition64(FloorC(a_World.GetSpawnX()), FloorC(a_World.GetSpawnY()), FloorC(a_World.GetSpawnZ()));
+		Pkt.WriteXYZPosition64(a_World.GetSpawnX(), a_World.GetSpawnY(), a_World.GetSpawnZ());
 	}
 
 	// Send the server difficulty:
@@ -923,13 +934,12 @@ void cProtocol_1_8_0::SendPlayerAbilities(void)
 {
 	ASSERT(m_State == 3);  // In game mode?
 
-	cPacketizer Pkt(*this, pktPlayerAbilities);
 	Byte Flags = 0;
-	cPlayer * Player = m_Client->GetPlayer();
-	if (Player->IsGameModeCreative())
+	const cPlayer * Player = m_Client->GetPlayer();
+
+	if (Player->IsGameModeCreative() || Player->IsGameModeSpectator())
 	{
-		Flags |= 0x01;
-		Flags |= 0x08;  // Godmode, used for creative
+		Flags |= 0x01;  // Invulnerability.
 	}
 	if (Player->IsFlying())
 	{
@@ -939,6 +949,12 @@ void cProtocol_1_8_0::SendPlayerAbilities(void)
 	{
 		Flags |= 0x04;
 	}
+	if (Player->IsGameModeCreative())
+	{
+		Flags |= 0x08;  // Godmode: creative instant break.
+	}
+
+	cPacketizer Pkt(*this, pktPlayerAbilities);
 	Pkt.WriteBEUInt8(Flags);
 	Pkt.WriteBEFloat(static_cast<float>(0.05 * Player->GetFlyingMaxSpeed()));
 	Pkt.WriteBEFloat(static_cast<float>(0.1 * Player->GetNormalMaxSpeed()));
@@ -2150,6 +2166,7 @@ void cProtocol_1_8_0::HandlePacketStatusRequest(cByteBuffer & a_ByteBuffer)
 	auto NumPlayers = static_cast<signed>(Server->GetNumPlayers());
 	auto MaxPlayers = static_cast<signed>(Server->GetMaxPlayers());
 	AString Favicon = Server->GetFaviconData();
+
 	cRoot::Get()->GetPluginManager()->CallHookServerPing(*m_Client, ServerDescription, NumPlayers, MaxPlayers, Favicon);
 
 	// Version:
@@ -2166,7 +2183,7 @@ void cProtocol_1_8_0::HandlePacketStatusRequest(cByteBuffer & a_ByteBuffer)
 
 	// Description:
 	Json::Value Description;
-	Description["text"] = ServerDescription.c_str();
+	Description["text"] = std::move(ServerDescription);
 
 	// Create the response:
 	Json::Value ResponseValue;
@@ -2792,27 +2809,37 @@ void cProtocol_1_8_0::HandlePacketWindowClose(cByteBuffer & a_ByteBuffer)
 
 void cProtocol_1_8_0::HandleVanillaPluginMessage(cByteBuffer & a_ByteBuffer, const AString & a_Channel)
 {
-	if (a_Channel == "MC|AdvCdm")
+	if ((a_Channel == "MC|AdvCdm") || (a_Channel == "MC|AdvCmd"))  // Spelling was fixed in 15w34
 	{
-		HANDLE_READ(a_ByteBuffer, ReadBEUInt8, UInt8, Mode);
+		// https://wiki.vg/index.php?title=Plugin_channels&oldid=14089#MC.7CAdvCmd
+		HANDLE_READ(a_ByteBuffer, ReadBEUInt8, UInt8, Dest);
 
-		switch (Mode)
+		switch (Dest)
 		{
 			case 0x00:
 			{
+				// Editing a command-block
 				HANDLE_READ(a_ByteBuffer, ReadBEInt32, Int32, BlockX);
 				HANDLE_READ(a_ByteBuffer, ReadBEInt32, Int32, BlockY);
 				HANDLE_READ(a_ByteBuffer, ReadBEInt32, Int32, BlockZ);
 				HANDLE_READ(a_ByteBuffer, ReadVarUTF8String, AString, Command);
-
 				m_Client->HandleCommandBlockBlockChange(BlockX, BlockY, BlockZ, Command);
+				break;
+			}
+
+			case 0x01:
+			{
+				// Editing a command-block-minecart
+				HANDLE_READ(a_ByteBuffer, ReadBEUInt32,      UInt32,  EntityID);
+				HANDLE_READ(a_ByteBuffer, ReadVarUTF8String, AString, Command);
+				m_Client->HandleCommandBlockEntityChange(EntityID, Command);
 				break;
 			}
 
 			default:
 			{
-				m_Client->SendChat(Printf("Failure setting command block command; unhandled mode %u (0x%02x)", Mode, Mode), mtFailure);
-				LOG("Unhandled MC|AdvCdm packet mode.");
+				m_Client->SendChat(Printf("Failure setting command block command; unhandled destination %u (0x%02x)", Dest, Dest), mtFailure);
+				LOG("Unhandled MC|AdvCmd packet destination.");
 				return;
 			}
 		}  // switch (Mode)
@@ -2853,7 +2880,7 @@ void cProtocol_1_8_0::HandleVanillaPluginMessage(cByteBuffer & a_ByteBuffer, con
 
 	// Read the payload and send it through to the clienthandle:
 	ContiguousByteBuffer Message;
-	VERIFY(a_ByteBuffer.ReadSome(Message, a_ByteBuffer.GetReadableSpace() - 1));
+	VERIFY(a_ByteBuffer.ReadSome(Message, a_ByteBuffer.GetReadableSpace()));
 	m_Client->HandlePluginMessage(a_Channel, Message);
 }
 
@@ -2975,51 +3002,21 @@ void cProtocol_1_8_0::SendEntitySpawn(const cEntity & a_Entity, const UInt8 a_Ob
 {
 	ASSERT(m_State == 3);  // In game mode?
 
+	cPacketizer Pkt(*this, pktSpawnObject);
+	Pkt.WriteVarInt32(a_Entity.GetUniqueID());
+	Pkt.WriteBEUInt8(a_ObjectType);
+	Pkt.WriteFPInt(a_Entity.GetPosX());
+	Pkt.WriteFPInt(a_Entity.GetPosY());
+	Pkt.WriteFPInt(a_Entity.GetPosZ());
+	Pkt.WriteByteAngle(a_Entity.GetPitch());
+	Pkt.WriteByteAngle(a_Entity.GetYaw());
+	Pkt.WriteBEInt32(a_ObjectData);
+
+	if (a_ObjectData != 0)
 	{
-		cPacketizer Pkt(*this, pktSpawnObject);
-		Pkt.WriteVarInt32(a_Entity.GetUniqueID());
-		Pkt.WriteBEUInt8(a_ObjectType);
-		Pkt.WriteFPInt(a_Entity.GetPosX());  // Position appears to be ignored...
-		Pkt.WriteFPInt(a_Entity.GetPosY());
-		Pkt.WriteFPInt(a_Entity.GetPosY());
-		Pkt.WriteByteAngle(a_Entity.GetPitch());
-		Pkt.WriteByteAngle(a_Entity.GetYaw());
-		Pkt.WriteBEInt32(a_ObjectData);
-
-		if (a_ObjectData != 0)
-		{
-			Pkt.WriteBEInt16(static_cast<Int16>(a_Entity.GetSpeedX() * 400));
-			Pkt.WriteBEInt16(static_cast<Int16>(a_Entity.GetSpeedY() * 400));
-			Pkt.WriteBEInt16(static_cast<Int16>(a_Entity.GetSpeedZ() * 400));
-		}
-	}
-
-	// Otherwise 1.8 clients don't show the entity
-	SendEntityTeleport(a_Entity);
-}
-
-
-
-
-
-void cProtocol_1_8_0::SendData(ContiguousByteBufferView a_Data)
-{
-	if (m_IsEncrypted)
-	{
-		std::byte Encrypted[8 KiB];  // Larger buffer, we may be sending lots of data (chunks)
-
-		while (a_Data.size() > 0)
-		{
-			const auto NumBytes = (a_Data.size() > sizeof(Encrypted)) ? sizeof(Encrypted) : a_Data.size();
-			m_Encryptor.ProcessData(Encrypted, a_Data.data(), NumBytes);
-			m_Client->SendData({ Encrypted, NumBytes });
-
-			a_Data = a_Data.substr(NumBytes);
-		}
-	}
-	else
-	{
-		m_Client->SendData(a_Data);
+		Pkt.WriteBEInt16(static_cast<Int16>(a_Entity.GetSpeedX() * 400));
+		Pkt.WriteBEInt16(static_cast<Int16>(a_Entity.GetSpeedY() * 400));
+		Pkt.WriteBEInt16(static_cast<Int16>(a_Entity.GetSpeedZ() * 400));
 	}
 }
 
@@ -3044,7 +3041,7 @@ void cProtocol_1_8_0::SendPacket(cPacketizer & a_Pkt)
 		cProtocol_1_8_0::CompressPacket(m_Compressor, CompressedPacket);
 
 		// Send the packet's payload compressed:
-		SendData(CompressedPacket);
+		m_Client->SendData(CompressedPacket);
 	}
 	else
 	{
@@ -3053,10 +3050,10 @@ void cProtocol_1_8_0::SendPacket(cPacketizer & a_Pkt)
 		ContiguousByteBuffer LengthData;
 		m_OutPacketLenBuffer.ReadAll(LengthData);
 		m_OutPacketLenBuffer.CommitRead();
-		SendData(LengthData);
+		m_Client->SendData(LengthData);
 
 		// Send the packet's payload directly:
-		SendData(PacketData);
+		m_Client->SendData(PacketData);
 	}
 
 	// Log the comm into logfile:

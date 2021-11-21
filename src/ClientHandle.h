@@ -101,6 +101,14 @@ public:  // tolua_export
 	We use Version-3 UUIDs for offline UUIDs, online UUIDs are Version-4, thus we can tell them apart. */
 	static bool IsUUIDOnline(const cUUID & a_UUID);  // Exported in ManualBindings.cpp
 
+	/** Function to mark bungee / proxy connection on this client, and to add proxy-related data */
+	void ProxyInit(const AString & a_IPString, const cUUID & a_UUID);
+	void ProxyInit(const AString & a_IPString, const cUUID & a_UUID, const Json::Value & a_Properties);
+
+	/** Processes the data in the network input buffer.
+	Called by both cWorld::Tick() and ServerTick(). */
+	void ProcessProtocolIn(void);
+
 	/** Flushes all buffered outgoing data to the network. */
 	void ProcessProtocolOut();
 
@@ -114,11 +122,14 @@ public:  // tolua_export
 
 	void Kick(const AString & a_Reason);  // tolua_export
 
-	/** Authenticates the specified user, called by cAuthenticator */
-	void Authenticate(const AString & a_Name, const cUUID & a_UUID, const Json::Value & a_Properties);
+	/** Authenticates the specified user with the bungee proxy server */
+	bool BungeeAuthenticate();
 
-	/** This function sends a new unloaded chunk to the player. Returns true if all chunks are loaded. */
-	bool StreamNextChunk();
+	/** Authenticates ourselves, called by cAuthenticator supplying player details from Mojang. */
+	void Authenticate(AString && a_Name, const cUUID & a_UUID, Json::Value && a_Properties);
+
+	/** Sends a set number of new chunks to the player on every invocation, until all chunks in the view distance have been sent. */
+	void StreamNextChunks();
 
 	/** Remove all loaded chunks that are no longer in range */
 	void UnloadOutOfRangeChunks(void);
@@ -126,7 +137,7 @@ public:  // tolua_export
 	inline bool IsLoggedIn(void) const { return (m_State >= csAuthenticating); }
 
 	/** Called while the client is being ticked from the world via its cPlayer object */
-	void Tick(float a_Dt);
+	void Tick(std::chrono::milliseconds a_Dt);
 
 	/** Called while the client is being ticked from the cServer object */
 	void ServerTick(float a_Dt);
@@ -201,7 +212,7 @@ public:  // tolua_export
 	void SendRemoveEntityEffect         (const cEntity & a_Entity, int a_EffectID);
 	void SendResourcePack               (const AString & a_ResourcePackUrl);
 	void SendResetTitle                 (void);  // tolua_export
-	void SendRespawn                    (eDimension a_Dimension, bool a_ShouldIgnoreDimensionChecks);
+	void SendRespawn                    (eDimension a_Dimension, bool a_IsRespawningFromDeath);
 	void SendScoreUpdate                (const AString & a_Objective, const AString & a_Player, cObjective::Score a_Score, Byte a_Mode);
 	void SendScoreboardObjective        (const AString & a_Name, const AString & a_DisplayName, Byte a_Mode);
 	void SendSetSubTitle                (const cCompositeChat & a_SubTitle);  // tolua_export
@@ -269,20 +280,20 @@ public:  // tolua_export
 	const AStringMap & GetForgeMods(void) const { return m_ForgeMods; }
 
 	/** Returns true if the client is modded with Forge. */
-	bool IsForgeClient(void) const { return m_ForgeHandshake.m_IsForgeClient; }
+	bool IsForgeClient(void) const { return m_ForgeHandshake.IsForgeClient; }
 
 	// tolua_end
 
 	/** Add the Forge mod list to the server ping response. */
 	void ForgeAugmentServerListPing(Json::Value & a_Response)
 	{
-		m_ForgeHandshake.AugmentServerListPing(a_Response);
+		m_ForgeHandshake.AugmentServerListPing(*this, a_Response);
 	}
 
 	/** Mark a client connection as using Forge. Set by the protocol. */
 	void SetIsForgeClient()
 	{
-		m_ForgeHandshake.m_IsForgeClient = true;
+		m_ForgeHandshake.IsForgeClient = true;
 	}
 
 	/** Returns true if the client wants the chunk specified to be sent (in m_ChunksToSend) */
@@ -310,11 +321,11 @@ public:  // tolua_export
 	/** Called when the protocol detects a chat packet. */
 	void HandleChat(const AString & a_Message);
 
-	/** Called when the protocol receives a MC|AdvCdm plugin message, indicating that the player set a new
+	/** Called when the protocol receives a message, indicating that the player set a new
 	command in the command block UI, for a block-based commandblock. */
 	void HandleCommandBlockBlockChange(int a_BlockX, int a_BlockY, int a_BlockZ, const AString & a_NewCommand);
 
-	/** Called when the protocol receives a MC|AdvCdm plugin message, indicating that the player set a new
+	/** Called when the protocol receives a message, indicating that the player set a new
 	command in the command block UI, for an entity-based commandblock (minecart?). */
 	void HandleCommandBlockEntityChange(UInt32 a_EntityID, const AString & a_NewCommand);
 
@@ -407,13 +418,9 @@ public:  // tolua_export
 	/** Returns the protocol version number of the protocol that the client is talking. Returns zero if the protocol version is not (yet) known. */
 	UInt32 GetProtocolVersion(void) const { return m_ProtocolVersion; }  // tolua_export
 
-	void InvalidateCachedSentChunk();
-
 	bool IsPlayerChunkSent();
 
 private:
-
-	friend class cServer;  // Needs access to SetSelf()
 
 	friend class cForgeHandshake;   // Needs access to FinishAuthenticate()
 
@@ -461,8 +468,9 @@ private:
 
 	/** A pointer to a World-owned player object, created in FinishAuthenticate when authentication succeeds.
 	The player should only be accessed from the tick thread of the World that owns him.
-	After the player object is handed off to the World, lifetime is managed automatically, guaranteed to outlast this client handle.
-	The player self-destructs some time after the client handle enters the Destroyed state. */
+	After the player object is handed off to the World, its lifetime is managed automatically, and strongly owns this client handle.
+	The player self-destructs some time after the client handle enters the Destroyed state.
+	We are therefore guaranteed that while m_State < Destroyed, that is when when we need to access m_Player, m_Player is valid. */
 	cPlayer * m_Player;
 
 	/** This is an optimization which saves you an iteration of m_SentChunks if you just want to know
@@ -472,17 +480,19 @@ private:
 	Otherwise, this contains an arbitrary value which should not be used. */
 	cChunkCoords m_CachedSentChunk;
 
+	bool m_ProxyConnection;  ///< True if player connected from a proxy (Bungee / Velocity)
+
 	bool m_HasSentDC;  ///< True if a Disconnect packet has been sent in either direction
 
 	// Chunk position when the last StreamChunks() was called; used to avoid re-streaming while in the same chunk
 	int m_LastStreamedChunkX;
 	int m_LastStreamedChunkZ;
 
-	/** The last time UnloadOutOfRangeChunks was called. */
-	cTickTimeLong m_LastUnloadCheck;
-
 	/** Number of ticks since the last network packet was received (increased in Tick(), reset in OnReceivedData()) */
 	std::atomic<int> m_TicksSinceLastPacket;
+
+	/** The time since UnloadOutOfRangeChunks was last called. */
+	std::chrono::milliseconds m_TimeSinceLastUnloadCheck;
 
 	/** Duration of the last completed client ping. */
 	std::chrono::steady_clock::duration m_Ping;
@@ -566,7 +576,7 @@ private:
 	float m_BreakProgress;
 
 	/** Finish logging the user in after authenticating. */
-	void FinishAuthenticate(const AString & a_Name, const cUUID & a_UUID, const Json::Value & a_Properties);
+	void FinishAuthenticate();
 
 	/** Returns true if the rate block interactions is within a reasonable limit (bot protection) */
 	bool CheckBlockInteractionsRate(void);
@@ -598,10 +608,6 @@ private:
 	/** Called to update m_State.
 	Only succeeds if a_NewState > m_State, otherwise returns false. */
 	bool SetState(eState a_NewState);
-
-	/** Processes the data in the network input buffer.
-	Called by both Tick() and ServerTick(). */
-	void ProcessProtocolIn(void);
 
 	// cTCPLink::cCallbacks overrides:
 	virtual void OnLinkCreated(cTCPLinkPtr a_Link) override;
